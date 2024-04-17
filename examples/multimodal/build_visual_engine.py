@@ -13,7 +13,8 @@ from tensorrt_llm.builder import Builder
 from PIL import Image
 from transformers import (AutoProcessor, Blip2ForConditionalGeneration,
                           Blip2Processor, LlavaForConditionalGeneration,
-                          NougatProcessor, VisionEncoderDecoderModel)
+                          NougatProcessor, VisionEncoderDecoderModel,
+                          LlavaNextProcessor, LlavaNextForConditionalGeneration)
 
 
 def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
@@ -124,11 +125,18 @@ def build_blip2_engine(args):
 
 
 def build_llava_engine(args):
-    processor = AutoProcessor.from_pretrained(args.model_path)
+    if "v1.6" in args.model_path:
+        processor = LlavaNextProcessor.from_pretrained(args.model_path)
+    else:
+        processor = AutoProcessor.from_pretrained(args.model_path)
     raw_image = Image.new('RGB', [10, 10])  # dummy image
     image = processor(text="dummy", images=raw_image,
                       return_tensors="pt")['pixel_values'].to(
-                          args.device, torch.float16)
+                      args.device, torch.float16)
+    if "v1.6" in args.model_path:
+        image = image.view(image.size()[0]*image.size()[1],
+                           image.size()[2],image.size()[3],
+                           image.size()[4])
 
     class LlavaVisionWrapper(torch.nn.Module):
 
@@ -143,8 +151,11 @@ def build_llava_engine(args):
                 image, output_hidden_states=True).hidden_states
             features = all_hidden_states[self.feature_layer][:, 1:]
             return self.projector(features)
-
-    model = LlavaForConditionalGeneration.from_pretrained(
+    if "v1.6" in args.model_path:
+        model = LlavaNextForConditionalGeneration.from_pretrained(args.model_path, 
+                                                                  torch_dtype=torch.float16)
+    else:
+        model = LlavaForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.float16)
     wrapper = LlavaVisionWrapper(model.vision_tower.to(args.device),
                                  model.multi_modal_projector.to(args.device),
