@@ -129,7 +129,7 @@ def build_llava_engine(args):
         processor = LlavaNextProcessor.from_pretrained(args.model_path)
     else:
         processor = AutoProcessor.from_pretrained(args.model_path)
-    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    raw_image = Image.new('RGB', [336, 336])  # dummy image
     image = processor(text="dummy", images=raw_image,
                       return_tensors="pt")['pixel_values'].to(
                       args.device, torch.float16)
@@ -236,7 +236,7 @@ if __name__ == '__main__':
                         default=None,
                         choices=[
                             'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
-                            'llava', 'vila', 'nougat'
+                            'llava', 'llava-next', 'vila', 'nougat'
                         ],
                         help="Model type")
     parser.add_argument('--model_path',
@@ -266,7 +266,7 @@ if __name__ == '__main__':
 
     if 'opt' in args.model_type or 't5' in args.model_type:
         build_blip2_engine(args)
-    elif args.model_type == 'llava':
+    elif args.model_type == 'llava' or args.model_type=='llava-next':
         build_llava_engine(args)
     elif args.model_type == 'vila':
         assert args.vila_path is not None, "Please clone and provide VILA source code path"

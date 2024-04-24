@@ -16,6 +16,7 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
                           Blip2Processor, NougatProcessor, NougatTokenizerFast)
+from transformers.image_processing_utils import select_best_resolution
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -61,6 +62,62 @@ def parse_arguments():
                         help='Check correctness of text output')
 
     return parser.parse_args()
+
+
+def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
+    """
+    Calculate the shape of the image patch grid after the preprocessing for images of any resolution.
+
+    Args:
+        image_size (`tuple`):
+            The size of the input image in the format (width, height).
+        grid_pinpoints (`List`):
+            A list containing possible resolutions. Each item in the list should be a tuple or list
+            of the form `(height, width)`.
+        patch_size (`int`):
+            The size of each image patch.
+
+    Returns:
+        tuple: The shape of the image patch grid in the format (width, height).
+    """
+    if not isinstance(grid_pinpoints, list):
+        raise ValueError("grid_pinpoints should be a list of tuples or lists")
+
+    height, width = select_best_resolution(image_size, grid_pinpoints)
+    return height // patch_size, width // patch_size
+
+
+def unpad_image(tensor, original_size):
+    """
+    Unpads a PyTorch tensor of a padded and resized image.
+
+    Args:
+        tensor (`torch.Tensor`):
+            The image tensor, assumed to be of shape (num_channels, height, width).
+        original_size (`tuple`):
+            The original size of the image (height, width).
+
+    Returns:
+        `torch.Tensor`: The unpadded image tensor.
+    """
+    original_height, original_width = original_size
+    current_height, current_width = tensor.shape[1:]
+
+    original_aspect_ratio = original_width / original_height
+    current_aspect_ratio = current_width / current_height
+
+    if original_aspect_ratio > current_aspect_ratio:
+        scale_factor = current_width / original_width
+        new_height = int(original_height * scale_factor)
+        padding = (current_height - new_height) // 2
+        unpadded_tensor = tensor[:, padding : current_height - padding, :]
+    else:
+        scale_factor = current_height / original_height
+        new_width = int(original_width * scale_factor)
+        padding = (current_width - new_width) // 2
+        unpadded_tensor = tensor[:, :, padding : current_width - padding]
+
+    return unpadded_tensor
 
 
 def trt_dtype_to_torch(dtype):
@@ -138,11 +195,21 @@ class MultiModalModel:
                 self.runtime_mapping = self.model.encoder_runtime_mapping
 
     def generate(self, pre_prompt, post_prompt, image, decoder_input_ids,
-                 max_new_tokens, warmup):
+                 max_new_tokens, warmup, **kwargs):
+
         if not warmup:
             profiler.start("Generate")
             profiler.start("Vision")
-        visual_features, visual_atts = self.get_visual_features(image)
+        if self.model_type == 'llava-next':
+            print("Found llava-next model")
+            image = image.view(image.shape[0]*image.shape[1],
+                               image.shape[2],
+                               image.shape[3],
+                               image.shape[4])
+
+            visual_features, visual_atts = self.get_visual_features(image, height=kwargs["height"], width=kwargs["width"])
+        else:
+            visual_features, visual_atts = self.get_visual_features(image, height=kwargs["height"], width=kwargs["width"])
         if not warmup:
             profiler.stop("Vision")
 
@@ -158,7 +225,7 @@ class MultiModalModel:
         else:
             post_input_ids = None
             length = pre_input_ids.shape[1] + visual_atts.shape[1]
-
+            
         input_lengths = torch.IntTensor([length] * args.batch_size).to(
             torch.int32)
         input_ids, ptuning_args = self.setup_fake_prompts(
@@ -233,7 +300,8 @@ class MultiModalModel:
             profiler.stop("Generate")
             return None
 
-    def get_visual_features(self, image):
+    def get_visual_features(self, image, **kwargs):
+
         visual_features = {'input': image.half()}
         visual_output_info = self.visual_encoder_session.infer_shapes(
             [TensorInfo('input', trt.DataType.HALF, image.shape)])
@@ -250,6 +318,48 @@ class MultiModalModel:
         self.stream.synchronize()
 
         image_embeds = visual_outputs['output']
+        
+        if self.model_type == "llava-next":
+            
+            img_height = kwargs["height"]
+            img_width = kwargs["width"]
+            
+            new_imageline = torch.nn.Parameter(torch.empty(4096, dtype=torch.float)).cuda()
+            split_size = image_embeds.shape[0]/args.batch_size
+            image_embeds = torch.split(image_embeds, int(split_size), dim=0)
+
+            new_image_embeds = []
+            image_grid_pinpoints = [[336,672],[672,336],[672,672],[1008,336],[336,1008]]
+            height = width = 336 // 14
+            
+            for image_idx, image_feature in enumerate(image_embeds):
+                if image_feature.shape[0] > 1:
+                    base_image_feature = image_feature[0]
+                    image_feature = image_feature[1:]
+                    
+                    if height * width != base_image_feature.shape[0]:
+                        raise ValueError("The number of patches is not consistent with the image size.")
+                    num_patch_height, num_patch_width = get_anyres_image_grid_shape((img_width,img_height),
+                                                                                     image_grid_pinpoints,
+                                                                                     336)
+
+                    image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                    image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                    image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                    image_feature = unpad_image(image_feature, (image.shape[-1],image.shape[-2]))
+                    image_feature = torch.cat(
+                                (
+                                    image_feature,
+                                    new_imageline[:, None, None].expand(*image_feature.shape[:-1], 1),
+                                ),
+                                dim=-1,
+                            )
+                    image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                    image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+                new_image_embeds.append(image_feature)
+
+            image_embeds =  torch.stack(new_image_embeds, dim=0)
+        
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
@@ -343,6 +453,9 @@ if __name__ == '__main__':
     )  # BLIP2-T5 and Nougat are using encoder-decoder models as LLMs
 
     image = load_test_image(model_type)
+    img_height = image.height
+    img_width = image.width
+
     if 'blip2' in model_type:
         processor = Blip2Processor.from_pretrained(model_type)
         image = processor(image, args.input_text,
@@ -365,7 +478,7 @@ if __name__ == '__main__':
         post_prompt = None
     elif 'llava' in model_type or 'vila' in model_type:
         # LLaVA and VILA
-        if model_type == "llava":
+        if model_type == "llava" or model_type == "llava-next":
             pre_prompt = "USER:\n"
             if args.input_text is None:
                 args.input_text = "Question: which city is this? Answer:"
@@ -384,16 +497,25 @@ if __name__ == '__main__':
             image_processor = vision_tower.image_processor
             image = image_processor(images=image,
                                     return_tensors="pt")['pixel_values']
+        elif "llava-v1.6" in args.hf_model_dir:
+            print("initiate preprocessor for llava1.6")
+            from transformers import LlavaNextProcessor
+            processor = LlavaNextProcessor.from_pretrained(args.hf_model_dir)
+            image = processor(text=args.input_text,
+                              images=image,
+                              return_tensors="pt")["pixel_values"]
         else:
             processor = AutoProcessor.from_pretrained(args.hf_model_dir)
             image = processor(text=args.input_text,
                               images=image,
                               return_tensors="pt")['pixel_values']
 
-    # Repeat inputs to match batch size
     pre_prompt = [pre_prompt] * args.batch_size
     post_prompt = [post_prompt] * args.batch_size
-    image = image.expand(args.batch_size, -1, -1, -1).contiguous()
+    if "llava-v1.6" in args.hf_model_dir:
+        image = image.expand(args.batch_size, -1, -1, -1, -1)
+    else:
+        image = image.expand(args.batch_size, -1, -1, -1).contiguous()
 
     model = MultiModalModel(args, model_type, decoder_llm)
     image = image.to(model.device)
@@ -417,7 +539,9 @@ if __name__ == '__main__':
                    image,
                    decoder_input_ids,
                    args.max_new_tokens,
-                   warmup=True)
+                   warmup=True,
+                   height=img_height,
+                   width=img_width)
     tensorrt_llm.mpi_barrier()
 
     num_iters = 20 if args.run_profiling else 1
@@ -427,7 +551,9 @@ if __name__ == '__main__':
                                        image,
                                        decoder_input_ids,
                                        args.max_new_tokens,
-                                       warmup=False)
+                                       warmup=False,
+                                       height=img_height,
+                                       width=img_width)
 
     if runtime_rank == 0:
         logger.info("---------------------------------------------------------")

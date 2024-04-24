@@ -10,6 +10,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [BLIP2-T5](#blip2-t5)
 - [BLIP2-OPT](#blip2-opt)
 - [LLaVA and VILA](#llava-and-vila)
+- [LLaVA-Next]
 - [Nougat](#nougat)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
@@ -247,6 +248,49 @@ OPT pipeline needs few minor changes from T5 pipeline
         --max_output_len 100 \
         --max_multimodal_len 576
    ```
+## LLaVA-Next
+
+1. Donwload models from huggingface(https://huggingface.co/llava-hf/llava-v1.6-vicuna-7b-hf)
+
+2. Convert Checkpoint
+    ```bash
+    python convert_checkpoint.py \
+    --model_dir /workspace/llava-v1.6-vicuna-7b-hf \
+    --output_dir /workspace/trt_models/llava16/fp16/1-gpu \
+    --dtype float16
+    ```
+    
+3. Build engine for LLM
+    ```bash
+    trtllm-build \
+    --checkpoint_dir /workspace/trt_models/llava16/fp16/1-gpu \
+    --output_dir /workspace/trt_engines/llava16/fp16/1-gpu \
+    --gemm_plugin float16 \
+    --use_fused_mlp \
+    --max_batch_size 1 \
+    --max_input_len 8192 \
+    --max_output_len 512 \
+    --max_multimodal_len 4096
+    ```
+    
+4. Build Viusal Engine
+    ```bash
+    python build_visual_engine.py --model_path /workspace/llava-v1.6-vicuna-7b-hf \
+                              --output_dir /workspace/trt_engines/llava16/fp16/visual_engine \
+                              --model_type llava-next \
+                              --max_batch_size 20 # set a large bs since llava-next uses multiple feature maps per image
+    ```
+
+5. Run inference
+    ```bash
+    python run.py \
+    --max_new_tokens 30 \
+    --hf_model_dir /workspace/llava-v1.6-vicuna-7b-hf \
+    --visual_engine_dir /workspace/trt_engines/llava16/fp16/visual_engine \
+    --llm_engine_dir /workspace/trt_engines/llava16/fp16/1-gpu \
+    --input_text "Question: which city is this? Answer:" 
+    ```
+
 
 ## Nougat
 
