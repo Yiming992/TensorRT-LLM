@@ -250,6 +250,11 @@ OPT pipeline needs few minor changes from T5 pipeline
    ```
 ## LLaVA-Next
 
+Note: Make sure you install the latest version of transformers
+```bash
+pip install transformers --upgrade
+```
+
 1. Donwload models from huggingface(https://huggingface.co/llava-hf/llava-v1.6-vicuna-7b-hf)
 
 2. Convert Checkpoint
